@@ -30,3 +30,54 @@ Pair-wise GSB 标注任务仓库（第 17 批 / 286）。
 1. 在本仓库中完成提示词要求的全部内容。
 2. `./mvnw -q verify` 必须通过。
 3. 完成后在所属分支（A 或 B）上提交，产物快照的父提交必须是初始环境快照。
+
+---
+
+## 实现说明（本次迭代）
+
+组件位于 `com.example.gsb.health` 包，核心类：
+
+| 类 | 职责 |
+|----|------|
+| `DependencyGraph` | 登记依赖、调用边（上游→下游）与功能→依赖映射；计算影响面与受影响上游 |
+| `HealthScorer` / `ScoreWeights` | 按错误率、响应时间、超时比例加权评分（0~100），权重可配置 |
+| `HealthAssessmentEngine` | 评估入口：评分 → 传播 → 降级/恢复判定 → 审计 → 统计 |
+| `AuditEvent` / `AuditTrail` | 降级与恢复事件审计（时间、依据、影响功能） |
+| `DegradationStats` | 统计快照：依赖数、当前降级项、触发次数、平均恢复时间 |
+
+### 传播规则
+
+**最弱链路规则**：依赖的有效健康分 = `min(自身健康分, 所有直接下游的有效健康分)`，
+沿调用边递归计算（对环安全）。即聚合服务的健康度不超过其最弱的下游，
+下游故障会自动拉低上游聚合服务的评分，从而触发对上游功能的精准降级。
+
+### 降级与恢复判定
+
+- 有效健康分 `< degradeThreshold` 时进入降级，只降级（传递）受该依赖影响的功能；
+- 处于降级状态的依赖需**连续** `requiredConsecutiveHealthyPasses` 次评估
+  有效分 `≥ recoveryThreshold` 才解除降级，中途任何一次不达标计数清零（抖动抑制）；
+- `recoveryThreshold ≥ degradeThreshold` 时可形成迟滞区间，进一步避免边界抖动。
+
+### 用法示例
+
+```java
+HealthAssessmentEngine engine = HealthAssessmentEngine.builder()
+        .weights(new ScoreWeights(0.5, 0.2, 0.3, 1000))
+        .degradeThreshold(60)
+        .requiredConsecutiveHealthyPasses(3)
+        .build();
+engine.addCallEdge("order-service", "payment");
+engine.mapFeature("checkout", "order-service");
+
+engine.recordMetrics("payment", new CallMetrics(0.8, 1200, 0.4));
+EvaluationReport report = engine.evaluate();
+report.degradedFeatures();   // 受影响功能清单
+engine.auditTrail().events(); // 审计事件
+engine.stats();               // 统计快照
+```
+
+### 运行测试
+
+```bash
+mvn -q verify
+```
